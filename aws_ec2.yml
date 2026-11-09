@@ -1,0 +1,20 @@
+
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - us-east-1
+
+filters:
+  tag:Project: devops-13-lesson
+  instance-state-name: running
+
+hostnames:
+  - tag:Name
+
+compose:
+  ansible_host: public_ip_address
+
+keyed_groups:
+  - key: tags.Role
+    prefix: ""
+    separator: ""
