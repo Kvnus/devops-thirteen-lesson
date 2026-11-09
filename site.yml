@@ -1,0 +1,241 @@
+
+# ========== PLAY 0: Provision EC2 ==========
+- name: Provision build and prod nodes in AWS EC2
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: provision
+  tasks:
+    - name: Find latest Ubuntu 22.04 AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners: ["099720109477"]     # Canonical
+        filters:
+          name: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+          state: available
+      register: ami_info
+
+    - name: Pick newest AMI
+      ansible.builtin.set_fact:
+        ami_id: "{{ (ami_info.images | sort(attribute='creation_date') | last).image_id }}"
+      when: state == 'present'
+
+    - name: Create SSH key pair
+      amazon.aws.ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ aws_region }}"
+        state: "{{ state }}"
+      register: key_result
+
+    - name: Save private key (only when newly created)
+      ansible.builtin.copy:
+        content: "{{ key_result.key.private_key }}"
+        dest: "{{ key_file }}"
+        mode: "0600"
+      when: key_result.changed and key_result.key.private_key is defined
+
+    - name: Create security group
+      amazon.aws.ec2_security_group:
+        name: "{{ sg_name }}"
+        description: SSH and app access
+        region: "{{ aws_region }}"
+        rules:
+          - { proto: tcp, ports: [22], cidr_ip: 0.0.0.0/0 }
+          - { proto: tcp, ports: ["{{ app_port }}"], cidr_ip: 0.0.0.0/0 }
+        state: present
+      register: sg
+      when: state == 'present'
+
+    - name: Launch EC2 instances
+      amazon.aws.ec2_instance:
+        name: "{{ item.name }}"
+        region: "{{ aws_region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        security_group: "{{ sg_name }}"
+        network:
+          assign_public_ip: true
+        volumes:
+          - device_name: /dev/sda1
+            ebs: { volume_size: 15, delete_on_termination: true }
+        tags: { Project: "{{ project_tag }}", Role: "{{ item.group }}" }
+        wait: true
+        state: running
+      loop: "{{ nodes }}"
+      register: ec2
+      when: state == 'present'
+
+    - name: Terminate EC2 instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+        state: absent
+        wait: true
+      when: state == 'absent'
+
+    - name: Refresh dynamic inventory (picks up the new instances)
+      ansible.builtin.meta: refresh_inventory
+      when: state == 'present'
+
+    - name: Wait for SSH on both nodes
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].ansible_host }}"
+        port: 22
+        delay: 5
+        timeout: 300
+      loop: "{{ groups['build'] + groups['prod'] }}"
+      when: state == 'present'
+
+# ========== PLAY 1: Build ==========
+- name: Build Java application on build node
+  hosts: build
+  become: true
+  tags: build
+  tasks:
+    - name: Install git, JDK and Maven
+      ansible.builtin.apt:
+        name: [git, openjdk-17-jdk, maven]
+        state: present
+        update_cache: true
+
+    - name: Create build workspace
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Clone application sources
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ build_dir }}/app-src"
+        version: "{{ repo_branch }}"
+
+    - name: Build with Maven
+      ansible.builtin.command: mvn -B clean package -DskipTests
+      args:
+        chdir: "{{ build_dir }}/app-src/{{ project_subdir }}"
+
+    - name: Locate built JAR
+      ansible.builtin.find:
+        paths: "{{ build_dir }}/app-src/{{ project_subdir }}/target"
+        patterns: "*.jar"
+        excludes: "*.original"
+      register: built_jars
+
+    - name: Fail if no JAR produced
+      ansible.builtin.assert:
+        that: built_jars.files | length == 1
+        fail_msg: "Expected exactly one JAR in target/"
+
+    - name: Fetch JAR to control node
+      ansible.builtin.fetch:
+        src: "{{ built_jars.files[0].path }}"
+        dest: "{{ local_artifact }}"
+        flat: true
+
+# ========== PLAY 2: Deploy to prod ==========
+- name: Deploy and run Java application on prod node
+  hosts: prod
+  become: true
+  tags: deploy
+  tasks:
+    - name: Install JRE (runtime only)
+      ansible.builtin.apt:
+        name: openjdk-17-jre-headless
+        state: present
+        update_cache: true
+
+    - name: Create application group
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        system: true
+
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        shell: /usr/sbin/nologin
+        system: true
+        create_home: false
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    - name: Copy JAR to prod
+      ansible.builtin.copy:
+        src: "{{ local_artifact }}"
+        dest: "{{ app_dir }}/app.jar"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+      notify: restart java-app
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: templates/java-app.service
+        dest: /etc/systemd/system/java-app.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart java-app
+
+    - name: Enable and start service
+      ansible.builtin.systemd:
+        name: java-app
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for application port
+      ansible.builtin.wait_for:
+        port: "{{ app_port }}"
+        timeout: 120
+
+    - name: Check application responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ app_port }}/"
+        status_code: [200, 404]   
+      register: health
+      retries: 6
+      delay: 5
+      until: health.status is defined
+
+    - name: Show public URL
+      ansible.builtin.debug:
+        msg: "App is up: http://{{ ansible_host }}:{{ app_port }}/"
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart java-app
+      ansible.builtin.systemd:
+        name: java-app
+        state: restarted
+
+# ========== PLAY 3: Summary ==========
+- name: Show IP addresses and how to connect
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [always, summary]
+  tasks:
+    - name: Print nodes and SSH commands
+      ansible.builtin.debug:
+        msg: |
+          {% for h in groups['build'] | default([]) + groups['prod'] | default([]) %}
+          {{ h }}: public IP {{ hostvars[h].ansible_host }}, private IP {{ hostvars[h].private_ip_address | default('-') }}
+            ssh -i {{ key_file }} {{ ansible_user }}@{{ hostvars[h].ansible_host }}
+          {% endfor %}
+          {% for h in groups['prod'] | default([]) %}
+          Application: http://{{ hostvars[h].ansible_host }}:{{ app_port }}/
+          {% endfor %}
+      when: state == 'present'
